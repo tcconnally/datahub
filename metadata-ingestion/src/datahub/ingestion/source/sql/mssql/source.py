@@ -1517,7 +1517,7 @@ class SQLServerSource(SQLAlchemySource):
         return result
 
     def _compute_is_discovered_table(self, name: str) -> bool:
-        """Uncached logic for is_discovered_table, which owns the caching."""
+        """Branch logic without caching; the caller caches the result."""
         if any(
             re.match(pattern, name, flags=re.IGNORECASE)
             for pattern in self.config.temporary_tables_pattern
@@ -1558,16 +1558,14 @@ class SQLServerSource(SQLAlchemySource):
                     return standardized_name in self.discovered_datasets
                 return False
 
-            # TSQL procedures reference tables as `schema.table` even though
-            # discovery records them as `db.schema.table`; match on the
-            # trailing `.schema.table` so these don't get dropped as temp.
-            # Cross-DB collisions are intentional (first-match-wins): this is
-            # a keep/drop gate for lineage, not a precise resolver. No pattern
-            # filtering needed here since discovered_datasets already passed it.
+            # Procedure bodies reference tables as `schema.table` while
+            # discovery records `db.schema.table`, so match on the trailing
+            # `.schema.table`. This is a keep/drop gate for lineage, not a
+            # precise resolver, so cross-DB collisions are accepted.
             if len(parts) == 2:
                 for discovered_name in self.discovered_datasets:
-                    # Leading "." requires a db-qualified match on a segment
-                    # boundary (so "dbo" won't match schema "xdbo").
+                    # Leading "." anchors the match to a segment boundary so
+                    # schema "dbo" won't match schema "xdbo".
                     if discovered_name.endswith(f".{standardized_name}"):
                         return True
 
