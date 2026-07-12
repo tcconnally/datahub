@@ -223,6 +223,15 @@ public class StandardPluginConfigurationTest extends AbstractTestNGSpringContext
   }
 
   @Test
+  public void testCorpUserPrivilegedFlagsValidatorBeanCreation() {
+    assertTrue(context.containsBean("corpUserPrivilegedFlagsValidator"));
+    AspectPayloadValidator validator =
+        context.getBean("corpUserPrivilegedFlagsValidator", AspectPayloadValidator.class);
+    assertNotNull(validator);
+    assertTrue(validator instanceof CorpUserPrivilegedFlagsValidator);
+  }
+
+  @Test
   public void testModifyIngestionSourceAuthValidatorBeanCreation() {
     assertTrue(context.containsBean("ModifyIngestionSourceAuthValidator"));
     AspectPayloadValidator validator =
@@ -302,7 +311,7 @@ public class StandardPluginConfigurationTest extends AbstractTestNGSpringContext
     assertEquals(mutator.getConfig().getClassName(), OwnershipOwnerTypes.class.getName());
     assertEquals(
         mutator.getConfig().getSupportedOperations(),
-        List.of("CREATE", "UPSERT", "UPDATE", "RESTATE", "PATCH"));
+        List.of("CREATE", "CREATE_ENTITY", "UPSERT", "UPDATE", "RESTATE", "PATCH"));
   }
 
   @Test

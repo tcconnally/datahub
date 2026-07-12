@@ -9,6 +9,7 @@ from collections import defaultdict
 from typing import (
     AbstractSet,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -22,6 +23,7 @@ from typing import (
 import pydantic.dataclasses
 import sqlglot
 import sqlglot.errors
+import sqlglot.expressions
 import sqlglot.lineage
 import sqlglot.optimizer
 import sqlglot.optimizer.annotate_types
@@ -37,6 +39,7 @@ from datahub.configuration.env_vars import (
     get_sql_agg_skip_joins,
     get_sql_parse_cache_size,
 )
+from datahub.emitter.mce_builder import make_schema_field_urn
 from datahub.ingestion.graph.client import DataHubGraph
 from datahub.metadata.schema_classes import (
     ArrayTypeClass,
@@ -62,6 +65,7 @@ from datahub.sql_parsing.sql_parsing_common import (
     DIALECTS_WITH_DEFAULT_UPPERCASE_COLS,
     QueryType,
     QueryTypeProps,
+    get_dialect_str,
 )
 from datahub.sql_parsing.sqlglot_utils import (
     DialectOrStr,
@@ -324,6 +328,13 @@ class _ColumnLineageInfo(_ParserBaseModel):
     logic: Optional[ColumnTransformation] = None
 
 
+def column_refs_to_schema_field_urns(refs: Iterable[ColumnRef]) -> List[str]:
+    # A ColumnRef can carry an empty column when upstream resolution couldn't
+    # cleanly identify a column (see _translate_internal_column_lineage), so we
+    # filter those out here rather than build an invalid schemaField URN.
+    return [make_schema_field_urn(ref.table, ref.column) for ref in refs if ref.column]
+
+
 class ColumnLineageInfo(_ParserBaseModel):
     """
     TODO: Instead of implementing custom __hash__ function this class should simply inherit from _FrozenModel.
@@ -339,6 +350,14 @@ class ColumnLineageInfo(_ParserBaseModel):
 
     def __hash__(self) -> int:
         return hash((self.downstream, tuple(self.upstreams), self.logic))
+
+    def downstream_schema_field_urn(self) -> Optional[str]:
+        if not self.downstream.table or not self.downstream.column:
+            return None
+        return make_schema_field_urn(self.downstream.table, self.downstream.column)
+
+    def upstream_schema_field_urns(self) -> List[str]:
+        return column_refs_to_schema_field_urns(self.upstreams)
 
 
 class _JoinInfo(_ParserBaseModel):
@@ -1066,8 +1085,16 @@ def _select_statement_cll(
                 continue
 
             try:
+                # output_col already holds the column's real casing (qualified with
+                # normalize=False). sqlglot.lineage would re-normalize the lookup name
+                # per dialect (upper for Snowflake, lower for case-insensitive ones),
+                # breaking the match and silently dropping lineage for mixed-case
+                # columns. case_sensitive marks the identifier so normalization skips
+                # it on every dialect and lineage() matches the name verbatim.
+                output_col_expr = sqlglot.expressions.column(output_col)
+                output_col_expr.this.meta["case_sensitive"] = True
                 lineage_node = sqlglot.lineage.lineage(
-                    output_col,
+                    output_col_expr,
                     statement,
                     dialect=dialect,
                     scope=root_scope,
@@ -1882,7 +1909,12 @@ def _translate_internal_column_lineage(
                 column=upstream.column,
             )
             for upstream in raw_column_lineage.upstreams
-            if upstream.table in table_name_urn_mapping
+            # upstream.column can be empty when sqlglot's column-lineage resolution
+            # can't cleanly resolve a column identifier against the upstream table's
+            # schema (e.g. under a schema/platform mismatch). Filtering it here means
+            # every consumer of ColumnLineageInfo gets a valid schemaField URN instead
+            # of one with an empty field path.
+            if upstream.table in table_name_urn_mapping and upstream.column
         ],
         logic=raw_column_lineage.logic,
     )
@@ -2373,14 +2405,22 @@ def create_lineage_sql_parsed_result(
             schema_resolver.close()
 
 
-def _prepare_sql_query_list(queries: Union[str, List[str]]) -> List[str]:
+def _prepare_sql_query_list(
+    queries: Union[str, List[str]], dialect: Optional[str] = None
+) -> List[str]:
     if isinstance(queries, str):
-        return [stmt for stmt in split_statements(queries) if stmt.strip()]
+        return [
+            stmt for stmt in split_statements(queries, dialect=dialect) if stmt.strip()
+        ]
     else:
         result: List[str] = []
         for q in queries:
             if q and str(q).strip():
-                result.extend(stmt for stmt in split_statements(str(q)) if stmt.strip())
+                result.extend(
+                    stmt
+                    for stmt in split_statements(str(q), dialect=dialect)
+                    if stmt.strip()
+                )
         return result
 
 
@@ -2393,6 +2433,7 @@ def create_lineage_from_sql_statements(
     default_schema: Optional[str] = None,
     graph: Optional[DataHubGraph] = None,
     schema_aware: bool = True,
+    is_temp_table: Optional[Callable[[str], bool]] = None,
 ) -> SqlParsingResult:
     """Parse multiple SQL statements and return merged lineage with temp table resolution.
 
@@ -2413,6 +2454,14 @@ def create_lineage_from_sql_statements(
         default_schema: Optional default schema for unqualified table references
         graph: Optional DataHub graph client for schema resolution
         schema_aware: Whether to use schema-aware parsing
+        is_temp_table: Optional predicate, given the table name in
+                       ``db.schema.table`` form (the platform instance, if any,
+                       is stripped before the predicate is called), returning
+                       whether it is an intermediate temp table. Use it when the
+                       dialect's own syntax does not mark them (e.g. Teradata
+                       ``CREATE VOLATILE TABLE`` parsed under another platform's
+                       dialect); such tables are then collapsed so lineage flows
+                       through to the real base tables.
 
     Returns:
         SqlParsingResult containing merged lineage from all statements
@@ -2423,7 +2472,7 @@ def create_lineage_from_sql_statements(
         SqlParsingAggregator,
     )
 
-    queries = _prepare_sql_query_list(queries)
+    queries = _prepare_sql_query_list(queries, dialect=get_dialect_str(platform))
 
     if not queries:
         return SqlParsingResult.make_from_error(
@@ -2454,6 +2503,7 @@ def create_lineage_from_sql_statements(
             generate_operations=False,
             generate_query_subject_fields=False,
             generate_query_usage_statistics=False,
+            is_temp_table=is_temp_table,
         )
 
         try:
